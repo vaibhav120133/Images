@@ -1,0 +1,245 @@
+import mysql.connector
+import streamlit as st
+import json
+
+# It's recommended to use Streamlit's secrets management for storing credentials
+# For demonstration, we are using a placeholder.
+# Replace with your actual database credentials.
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'your_user',
+    'password': 'your_password',
+    'database': 'vehicle_service_db'
+}
+
+class Database:
+    """
+    A class to manage all database operations for the Vehicle Service Management System.
+    """
+
+    def __init__(self, config):
+        """
+        Initializes the Database object and connects to MySQL.
+        Args:
+            config (dict): A dictionary containing database connection parameters.
+        """
+        self.config = config
+        self.conn = self.connect()
+        if self.conn:
+            self.create_tables()
+
+    def connect(self):
+        """
+        Establishes a connection to the MySQL database.
+        Returns:
+            mysql.connector.connection_cext.CMySQLConnection: A connection object or None if connection fails.
+        """
+        try:
+            conn = mysql.connector.connect(**self.config)
+            st.success("Successfully connected to the database.")
+            return conn
+        except mysql.connector.Error as err:
+            if err.errno == 1049:  # Database does not exist
+                try:
+                    # Temporarily connect without a database to create it
+                    temp_config = self.config.copy()
+                    del temp_config['database']
+                    conn = mysql.connector.connect(**temp_config)
+                    cursor = conn.cursor()
+                    cursor.execute(f"CREATE DATABASE {self.config['database']}")
+                    cursor.close()
+                    conn.close()
+                    # Reconnect to the newly created database
+                    conn = mysql.connector.connect(**self.config)
+                    st.success(f"Database '{self.config['database']}' created and connected.")
+                    return conn
+                except mysql.connector.Error as create_err:
+                    st.error(f"Failed to create database: {create_err}")
+                    return None
+            else:
+                st.error(f"Error connecting to database: {err}")
+                return None
+
+
+    def get_cursor(self):
+        """
+        Returns a cursor for executing database queries.
+        Handles connection reopening if it has been closed.
+        """
+        try:
+            # Check if connection is alive, if not, reconnect
+            if not self.conn.is_connected():
+                self.conn = self.connect()
+            return self.conn.cursor(dictionary=True)
+        except mysql.connector.Error as err:
+            st.error(f"Error getting cursor: {err}")
+            self.conn = self.connect() # Attempt to reconnect
+            return self.conn.cursor(dictionary=True) if self.conn else None
+
+
+    def create_tables(self):
+        """
+        Creates the 'users' and 'services' tables in the database if they do not already exist.
+        """
+        cursor = self.get_cursor()
+        if not cursor:
+            return
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    full_name VARCHAR(255) NOT NULL,
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    phone VARCHAR(20) NOT NULL UNIQUE,
+                    password VARCHAR(255) NOT NULL,
+                    user_type VARCHAR(50) DEFAULT 'Customer'
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS services (
+                    service_id INT AUTO_INCREMENT PRIMARY KEY,
+                    customer_name VARCHAR(255),
+                    customer_email VARCHAR(255),
+                    customer_phone VARCHAR(255),
+                    vehicle_type VARCHAR(50),
+                    vehicle_brand VARCHAR(50),
+                    vehicle_model VARCHAR(50),
+                    vehicle_no VARCHAR(50),
+                    service_types JSON,
+                    description TEXT,
+                    pickup_required VARCHAR(10),
+                    pickup_address TEXT,
+                    service_date DATE,
+                    status VARCHAR(50) DEFAULT 'Pending',
+                    assigned_mechanic VARCHAR(255),
+                    payment_status VARCHAR(50) DEFAULT 'Pending',
+                    base_cost DECIMAL(10, 2),
+                    extra_charges DECIMAL(10, 2) DEFAULT 0.00,
+                    charge_description TEXT,
+                    work_done TEXT,
+                    request_date DATETIME
+                )
+            """)
+            self.conn.commit()
+        except mysql.connector.Error as err:
+            st.error(f"Error creating tables: {err}")
+        finally:
+            cursor.close()
+
+    def execute_query(self, query, params=None, fetch=None):
+        """
+        Executes a given SQL query.
+        Args:
+            query (str): The SQL query to execute.
+            params (tuple, optional): The parameters to substitute into the query. Defaults to None.
+            fetch (str, optional): Type of fetch ('one' or 'all'). Defaults to None.
+        Returns:
+            Result of the query if fetch is specified, otherwise None.
+        """
+        cursor = self.get_cursor()
+        if not cursor:
+            return None
+        try:
+            cursor.execute(query, params)
+            if fetch == 'one':
+                result = cursor.fetchone()
+                return result
+            elif fetch == 'all':
+                result = cursor.fetchall()
+                return result
+            else:
+                self.conn.commit()
+                return cursor.lastrowid
+        except mysql.connector.Error as err:
+            st.error(f"Database query failed: {err}")
+            return None
+        finally:
+            cursor.close()
+
+# Instantiate the database connection
+# This will be imported by other modules
+db = Database(DB_CONFIG)
+
+# --- User Management ---
+
+def add_user(full_name, email, phone, password, user_type='Customer'):
+    query = "INSERT INTO users (full_name, email, phone, password, user_type) VALUES (%s, %s, %s, %s, %s)"
+    params = (full_name, email, phone, password, user_type)
+    return db.execute_query(query, params)
+
+def get_user_by_email(email):
+    query = "SELECT * FROM users WHERE email = %s"
+    return db.execute_query(query, (email,), fetch='one')
+
+def get_user_by_email_and_phone(email, phone):
+    query = "SELECT * FROM users WHERE email = %s AND phone = %s"
+    return db.execute_query(query, (email, phone), fetch='one')
+
+def get_all_users():
+    query = "SELECT * FROM users"
+    return db.execute_query(query, fetch='all')
+
+def update_user_password(email, new_password):
+    query = "UPDATE users SET password = %s WHERE email = %s"
+    return db.execute_query(query, (new_password, email))
+
+
+# --- Service Management ---
+
+def add_service(service_data):
+    # Convert list to JSON string for storage
+    service_data['service_types'] = json.dumps(service_data.get('service_types', []))
+
+    query = """
+        INSERT INTO services (customer_name, customer_email, customer_phone, vehicle_type,
+        vehicle_brand, vehicle_model, vehicle_no, service_types, description, pickup_required,
+        pickup_address, service_date, status, payment_status, base_cost, request_date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (
+        service_data['customer_name'], service_data['customer_email'], service_data['customer_phone'],
+        service_data['vehicle_type'], service_data['vehicle_brand'], service_data['vehicle_model'],
+        service_data['vehicle_no'], service_data['service_types'], service_data['description'],
+        service_data['pickup_required'], service_data.get('pickup_address'), service_data['service_date'],
+        service_data.get('status', 'Pending'), service_data.get('payment_status', 'Pending'),
+        service_data['base_cost'], service_data['request_date']
+    )
+    return db.execute_query(query, params)
+
+def get_all_services():
+    services = db.execute_query("SELECT * FROM services", fetch='all')
+    if services:
+        for service in services:
+            if isinstance(service.get('service_types'), str):
+                service['service_types'] = json.loads(service['service_types'])
+    return services
+
+def get_service_by_id(service_id):
+    service = db.execute_query("SELECT * FROM services WHERE service_id = %s", (service_id,), fetch='one')
+    if service and isinstance(service.get('service_types'), str):
+        service['service_types'] = json.loads(service['service_types'])
+    return service
+
+def get_services_by_customer_email(email):
+    services = db.execute_query("SELECT * FROM services WHERE customer_email = %s", (email,), fetch='all')
+    if services:
+        for service in services:
+            if isinstance(service.get('service_types'), str):
+                service['service_types'] = json.loads(service['service_types'])
+    return services
+
+def update_service_status(service_id, status):
+    return db.execute_query("UPDATE services SET status = %s WHERE service_id = %s", (status, service_id))
+
+def update_service_payment_status(service_id, payment_status):
+    return db.execute_query("UPDATE services SET payment_status = %s WHERE service_id = %s", (payment_status, service_id))
+
+def assign_mechanic(service_id, mechanic_name):
+    return db.execute_query("UPDATE services SET assigned_mechanic = %s WHERE service_id = %s", (mechanic_name, service_id))
+
+def update_extra_charges(service_id, extra_charges, charge_description):
+    query = "UPDATE services SET extra_charges = %s, charge_description = %s WHERE service_id = %s"
+    return db.execute_query(query, (extra_charges, charge_description, service_id))
+
+def update_work_description(service_id, work_done):
+    return db.execute_query("UPDATE services SET work_done = %s WHERE service_id = %s", (work_done, service_id))
